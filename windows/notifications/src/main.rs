@@ -62,6 +62,8 @@ const AUMID: &str = "ClaudeCode.Hooks";
 #[derive(Deserialize, Default)]
 struct Config {
     editor: Option<String>,
+    desktop: Option<bool>,   // false = skip desktop notification (webhook-only mode)
+    sound: Option<String>,   // "default", sound name, or "" to disable
     messages: Option<Messages>,
     icons: Option<Icons>,
     webhook: Option<WebhookConfig>,
@@ -72,17 +74,22 @@ struct Messages {
     notification: Option<String>,
     permission: Option<String>,
     elicitation: Option<String>,
+    idle: Option<String>,
     stop: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct Icons {
     notification: Option<String>,
+    permission: Option<String>,
+    elicitation: Option<String>,
+    idle: Option<String>,
     stop: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct WebhookConfig {
+    enabled: Option<bool>,    // false = disable webhook without removing config
     url: Option<String>,
     idle_minutes: Option<u32>,
     payload: Option<String>,  // Path to JSON template file
@@ -200,9 +207,7 @@ fn notify(hook_event: &str, base_dir: &Path, config: &Config) -> i32 {
 
     let cwd = json_cwd.as_deref()
         .or(timer.get(3).map(|s| s.as_str())).unwrap_or_default();
-    // Prefer tab name (captured from WT title bar) over cwd basename
-    let dir = timer.get(5).filter(|s| !s.is_empty()).map(|s| s.to_string())
-        .unwrap_or_else(|| Path::new(cwd).file_name().unwrap_or_default().to_string_lossy().to_string());
+    let dir = Path::new(cwd).file_name().unwrap_or_default().to_string_lossy().to_string();
 
     // Elapsed time since last user message
     let start_ms: u64 = timer.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -218,6 +223,7 @@ fn notify(hook_event: &str, base_dir: &Path, config: &Config) -> i32 {
         match notification_type {
             "permission_prompt" => config.messages.as_ref().and_then(|m| m.permission.as_deref()).unwrap_or("Claude needs permission"),
             "elicitation_dialog" => config.messages.as_ref().and_then(|m| m.elicitation.as_deref()).unwrap_or("Action required"),
+            "idle_prompt" => config.messages.as_ref().and_then(|m| m.idle.as_deref()).unwrap_or("Claude is waiting"),
             _ => config.messages.as_ref().and_then(|m| m.notification.as_deref()).unwrap_or("Claude needs your input"),
         }
     };
@@ -225,7 +231,14 @@ fn notify(hook_event: &str, base_dir: &Path, config: &Config) -> i32 {
     let icon_file = if hook_event == "stop" {
         config.icons.as_ref().and_then(|i| i.stop.as_deref()).unwrap_or("icons/stop.png")
     } else {
-        config.icons.as_ref().and_then(|i| i.notification.as_deref()).unwrap_or("icons/notification.png")
+        let type_icon = match notification_type {
+            "permission_prompt" => config.icons.as_ref().and_then(|i| i.permission.as_deref()),
+            "elicitation_dialog" => config.icons.as_ref().and_then(|i| i.elicitation.as_deref()),
+            "idle_prompt" => config.icons.as_ref().and_then(|i| i.idle.as_deref()),
+            _ => None,
+        };
+        type_icon.or_else(|| config.icons.as_ref().and_then(|i| i.notification.as_deref()))
+            .unwrap_or("icons/notification.png")
     };
     let icon_path = base_dir.join(icon_file);
     let icon_str = icon_path.to_string_lossy().replace('\\', "/");
@@ -248,6 +261,12 @@ fn notify(hook_event: &str, base_dir: &Path, config: &Config) -> i32 {
             esc(&editor_label), esc(&editor_uri))
     } else { String::new() };
 
+    let audio_xml = match config.sound.as_deref() {
+        Some("") => r#"<audio silent="true" />"#.to_string(),
+        Some("default") | None => String::new(),
+        Some(name) => format!(r#"<audio src="ms-winsoundevent:Notification.{}" />"#, esc(name)),
+    };
+
     let xml = format!(
 r#"<toast launch="{focus}" activationType="protocol">
   <visual><binding template="ToastGeneric">
@@ -259,23 +278,27 @@ r#"<toast launch="{focus}" activationType="protocol">
     <action content="Focus Terminal" arguments="{focus}" activationType="protocol" />
     {editor}
   </actions>
+  {audio}
 </toast>"#,
         focus = esc(&focus_uri), dir = esc(&dir), msg = esc(message),
         elapsed = esc(&elapsed), icon = icon_xml, editor = editor_xml,
+        audio = audio_xml,
     );
 
-    let toast_result = show_toast(&xml, &sid);
+    let toast_result = if config.desktop.unwrap_or(true) {
+        show_toast(&xml, &sid)
+    } else { 0 };
 
-
-    // Send webhook after toast is shown (only when AFK)
+    // Send webhook after toast (only when AFK, or always if idle_minutes == 0)
     // auth_success is already skipped above
-    // Guard: elapsed time must also exceed idle_minutes — can't be AFK longer
-    // than Claude has been running since the last user prompt.
     if let Some(ref webhook) = config.webhook {
+        if webhook.enabled.unwrap_or(true) {
         if let (Some(ref url), Some(ref payload_file)) = (&webhook.url, &webhook.payload) {
             if !url.is_empty() && !payload_file.is_empty() {
                 let idle_minutes = webhook.idle_minutes.unwrap_or(15);
-                if s >= idle_minutes as u64 * 60 && is_afk(idle_minutes) {
+                let send = idle_minutes == 0
+                    || (s >= idle_minutes as u64 * 60 && is_afk(idle_minutes));
+                if send {
                     let url = url.clone();
                     let template_path = base_dir.join(payload_file);
                     let dir = dir.clone();
@@ -297,6 +320,7 @@ r#"<toast launch="{focus}" activationType="protocol">
                     let _ = handle.join();
                 }
             }
+        }
         }
     }
 

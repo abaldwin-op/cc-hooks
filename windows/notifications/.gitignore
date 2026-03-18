@@ -3,4 +3,5 @@ webhook*.json
 !webhook*.json.example
 icons/
 target/
+src/bin/
 src/obj/

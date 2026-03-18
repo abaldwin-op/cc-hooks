@@ -1,18 +1,25 @@
 {
     "title": "CC Notification",
     "editor": "zed",
+    "desktop": true,
+    "sound": "default",
     "messages": {
         "notification": "Claude needs your input",
         "permission": "Claude needs permission",
         "elicitation": "Action required",
+        "idle": "Claude is waiting",
         "stop": "Task completed"
     },
     "icons": {
         "notification": "icons/notification.png",
+        "permission": "icons/notification.png",
+        "elicitation": "icons/notification.png",
+        "idle": "icons/notification.png",
         "stop": "icons/stop.png",
         "title": "icons/title.ico"
     },
     "webhook": {
+        "enabled": true,
         "url": "",
         "idle_minutes": 15,
         "payload": "webhook.json"

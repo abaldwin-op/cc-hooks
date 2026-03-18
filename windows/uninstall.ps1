@@ -27,7 +27,7 @@ if ($isAdmin) {
 }
 
 # Hook config + temp file cleanup
-$exe = Join-Path $PSScriptRoot "notifications\bin\notifications.exe"
+$exe = Join-Path $PSScriptRoot "notifications\target\release\notifications.exe"
 if (Test-Path $exe) {
     & $exe uninstall
 } else {

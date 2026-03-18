@@ -29,14 +29,26 @@ swift build -c release 2>&1 | tail -3
 
 # Assemble .app bundle
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp .build/release/notifications "$EXE"
 
+# Copy app icon if available (configurable via icons.app in config.json)
+APP_ICON=$(python3 -c "import json; print(json.load(open('$NOTIF_DIR/config.json')).get('icons', {}).get('app', 'icons/AppIcon.png'))" 2>/dev/null || echo "icons/AppIcon.png")
+if [[ -f "$NOTIF_DIR/$APP_ICON" ]]; then
+    cp "$NOTIF_DIR/$APP_ICON" "$APP_DIR/Contents/Resources/AppIcon.png"
+fi
+
 # Generate Info.plist with title from config
-sed "s/CC Notifications/$TITLE/" "$NOTIF_DIR/Info.plist" > "$APP_DIR/Contents/Info.plist"
+python3 -c "
+import sys
+with open(sys.argv[1]) as f: plist = f.read()
+print(plist.replace('CC Notifications', sys.argv[2]), end='')
+" "$NOTIF_DIR/Info.plist" "$TITLE" > "$APP_DIR/Contents/Info.plist"
 
 # Ad-hoc sign the bundle
-codesign -s - "$APP_DIR" 2>/dev/null || true
+if ! codesign --force --sign - "$APP_DIR"; then
+    echo "Warning: ad-hoc code signing failed — notifications may not work correctly"
+fi
 
 # Register hooks
 "$EXE" install

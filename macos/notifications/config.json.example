@@ -2,17 +2,25 @@
     "title": "CC Notification",
     "terminal": "ghostty",
     "editor": "zed",
+    "desktop": true,
+    "sound": "default",
     "messages": {
         "notification": "Claude needs your input",
         "permission": "Claude needs permission",
         "elicitation": "Action required",
+        "idle": "Claude is waiting",
         "stop": "Task completed"
     },
     "icons": {
+        "app": "icons/AppIcon.png",
         "notification": "icons/notification.png",
+        "permission": "icons/notification.png",
+        "elicitation": "icons/notification.png",
+        "idle": "icons/notification.png",
         "stop": "icons/stop.png"
     },
     "webhook": {
+        "enabled": true,
         "url": "",
         "idle_minutes": 15,
         "payload": "webhook.json"

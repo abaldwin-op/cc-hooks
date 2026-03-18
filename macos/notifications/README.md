@@ -4,45 +4,37 @@ macOS desktop notifications for [Claude Code](https://claude.com/product/claude-
 
 ## Why not just use...
 
-**[Built-in terminal notifications](https://code.claude.com/docs/en/terminal-config#notification-setup)?** [Ghostty](https://ghostty.org/), [Kitty](https://sw.kovidgoyal.net/kitty/), and [WezTerm](https://wezfurlong.org/wezterm/) support them natively, but the click-to-focus behavior is limited. On macOS, clicking a Ghostty notification from a split pane [opens a new window](https://github.com/ghostty-org/ghostty/discussions/10445) instead of focusing the originating pane. The Linux fix ([#9145](https://github.com/ghostty-org/ghostty/issues/9145)) hasn't been ported to macOS yet. WezTerm shows notifications but clicking them only brings the window to the foreground — not the originating tab or pane ([PR #7643](https://github.com/wez/wezterm/pull/7643) is open to fix this). [iTerm2](https://iterm2.com/)'s built-in notifications (Settings → Profiles → Terminal → Notification Center Alerts) do focus the correct session/pane on click, but don't offer elapsed time or editor integration.
+**[Built-in terminal notifications](https://code.claude.com/docs/en/terminal-config#notification-setup)?** [Ghostty](https://ghostty.org/) notifications from a split pane [open a new window](https://github.com/ghostty-org/ghostty/discussions/10445) instead of focusing the originating pane. [WezTerm](https://wezfurlong.org/wezterm/) clicking only brings the window to the foreground — not the tab or pane. [iTerm2](https://iterm2.com/)'s built-in notifications focus the correct pane but don't offer elapsed time or editor integration.
 
-**[terminal-notifier](https://github.com/julienXX/terminal-notifier)?** It can show notifications, but doesn't know about Claude Code sessions — no elapsed time, no terminal focus, no editor integration. This project uses native macOS APIs directly and falls back to terminal-notifier if needed.
+**[terminal-notifier](https://github.com/julienXX/terminal-notifier)?** No session awareness — no elapsed time, terminal focus, or editor integration. This project uses native macOS APIs and falls back to terminal-notifier if needed.
 
-**`osascript display notification`?** No click actions at all — it's a fire-and-forget alert.
-
-<!-- TODO: Verify if Ghostty has fixed macOS notification focus
-     https://github.com/ghostty-org/ghostty/issues/9145
-     https://github.com/ghostty-org/ghostty/discussions/10445
-     TODO: Verify if WezTerm has merged click-to-focus
-     https://github.com/wez/wezterm/pull/7643 -->
+**`osascript display notification`?** No click actions.
 
 ## What it does
 
 When Claude finishes or needs input, you get a notification showing:
 - **Project directory** and **elapsed time** (e.g., "Task completed (12s)")
-- Clicking the notification body focuses the correct terminal **window/tab/pane**
-  - Ghostty (1.3.0+): matched by terminal ID, fallback to working directory
-  - iTerm2: matched by session ID, fallback to tty device
-  - [WezTerm](https://wezfurlong.org/wezterm/): matched by pane ID via CLI
-  - [Terminal.app](https://support.apple.com/guide/terminal/welcome/mac): matched by tty device
-- **Open in Editor** button — opens the project directory in your configured editor
+- Clicking the notification body focuses the correct **window/tab/pane**:
+  - Ghostty: 3-pass matching (terminal+tab+window ID → CWD+name → prefix CWD)
+  - iTerm2: session ID → CWD+name → prefix CWD
+  - WezTerm: pane ID via CLI
+  - Terminal.app: tty → process name
+- **Open in Editor** button — opens the project in your configured editor
 - Notifications replace by session (no stacking)
 - Falls back to terminal-notifier, then `osascript` if native notifications are unavailable
-- Optional **webhook** — sends a push notification when you're AFK (screen locked or idle)
+- Optional **webhook** — sends to Discord, Slack, ntfy, etc. when you're AFK (screen locked or idle)
+- Configurable notification sound
 - Skips IDE terminals (VS Code, Zed, Cursor) — only fires in standalone terminals
-- Per-type notification messages:
-
-| Type | Default message | Webhook behavior |
-|------|----------------|-----------------|
-| `idle_prompt` | "Claude needs your input" | Only when AFK |
-| `permission_prompt` | "Claude needs permission" | Always (blocks Claude) |
-| `elicitation_dialog` | "Action required" | Always (blocks Claude) |
-| `stop` | "Task completed" | Only when AFK |
-| `auth_success` | Skipped | Skipped |
+- Per-type notification messages and icons (see `config.json.example`)
 
 ## Setup
 
-Or just run `bash macos/install.sh notifications` from the repo root.
+```bash
+cd macos
+bash install.sh
+```
+
+This builds the Swift binary, assembles a `.app` bundle (required for native notifications), ad-hoc signs it, and registers hooks in `~/.claude/settings.json`.
 
 ### Prerequisites
 
@@ -50,34 +42,14 @@ Or just run `bash macos/install.sh notifications` from the repo root.
 - Swift 5.9+ (`xcode-select --install` if needed)
 - Optional: [terminal-notifier](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`) as a fallback
 
-### Build
-
-```bash
-cd macos/notifications
-swift build -c release
-```
-
-The install script assembles the binary into a `.app` bundle (required for native macOS notifications) and ad-hoc signs it.
-
-### Install
-
-```bash
-cd macos
-bash install.sh
-```
-
-Or just run `bash macos/install.sh notifications` from the repo root.
-
 ### Uninstall
 
 ```bash
-cd macos
-bash uninstall.sh
+cd macos/notifications
+.build/release/notifications uninstall
 ```
 
-Or just run `bash macos/uninstall.sh notifications` from the repo root.
-
-This removes notification hooks from `~/.claude/settings.json` and cleans up temp files.
+Removes hooks from `~/.claude/settings.json` and cleans up temp files.
 
 ## Configuration
 
@@ -85,23 +57,31 @@ Copy `config.json.example` to `config.json` and edit:
 
 ```json
 {
-    "title": "CC Notification",
+    "title": "Claude Code",
     "terminal": "ghostty",
     "editor": "zed",
+    "desktop": true,
+    "sound": "default",
     "messages": {
         "notification": "Claude needs your input",
         "permission": "Claude needs permission",
         "elicitation": "Action required",
+        "idle": "Claude is waiting",
         "stop": "Task completed"
     },
     "icons": {
-        "notification": "icons/notification.png",
-        "stop": "icons/stop.png"
+        "app": "icons/AppIcon.png",
+        "notification": "icons/clawd.png",
+        "permission": "icons/clawd.png",
+        "elicitation": "icons/clawd.png",
+        "idle": "icons/clawd.png",
+        "stop": "icons/clawd-happy.png"
     },
     "webhook": {
+        "enabled": true,
         "url": "",
         "idle_minutes": 15,
-        "payload": "webhook.json"
+        "payload": "webhook.discord.json"
     }
 }
 ```
@@ -111,41 +91,39 @@ Copy `config.json.example` to `config.json` and edit:
 | `title` | Name shown in the .app bundle and notification attribution |
 | `terminal` | Terminal to focus on click (`ghostty`, `iterm2`, `wezterm`, `terminal`) |
 | `editor` | Editor to open projects in (`zed`, `code`, `cursor`) |
+| `desktop` | Set to `false` to skip desktop notifications (webhook-only mode) |
+| `sound` | `"default"`, a sound name (see below), or `""` to disable |
+
+#### Sound names
+
+macOS uses sounds from `/System/Library/Sounds/` and `~/Library/Sounds/`. Built-in options:
+
+`Basso`, `Blow`, `Bottle`, `Frog`, `Funk`, `Glass`, `Hero`, `Morse`, `Ping`, `Pop`, `Purr`, `Sosumi`, `Submarine`, `Tink`
+
+Drop a `.aiff`, `.wav`, or `.caf` file in `~/Library/Sounds/` to use a custom sound.
+
+### Icons
+
+Place in `icons/` (gitignored). Each notification type can have its own icon — see `config.json.example` for all slots. Types without a specific icon fall back to `notification`.
 
 ### Webhook
 
-When configured, sends a JSON POST to the webhook URL if you're AFK (screen locked or idle for `idle_minutes`). The payload is defined by a JSON template file with variable substitution.
+Sends a JSON POST when you're AFK (screen locked or idle for `idle_minutes`). Useful for Discord, Slack, ntfy, Gotify, etc.
 
 | Field | Description |
 |-------|-------------|
+| `webhook.enabled` | Set to `false` to disable without removing config |
 | `webhook.url` | Webhook endpoint (leave empty to disable) |
 | `webhook.idle_minutes` | Minutes of inactivity before sending (default: 15, `0` = always send) |
 | `webhook.payload` | Path to JSON template file (relative to notifications/) |
 
-Copy one of the service-specific examples and customize (e.g., `cp webhook.discord.json.example webhook.discord.json`):
-- `webhook.gotify.json.example` — [Gotify](https://gotify.net/) (URL must include `?token=<apptoken>`)
+Copy a service-specific example and customize:
 - `webhook.discord.json.example` — [Discord](https://discord.com/)
-- `webhook.ntfy.json.example` — [ntfy](https://ntfy.sh/) (URL must be the root, e.g., `https://ntfy.sh/`, not the topic URL)
 - `webhook.slack.json.example` — [Slack](https://slack.com/)
+- `webhook.ntfy.json.example` — [ntfy](https://ntfy.sh/)
+- `webhook.gotify.json.example` — [Gotify](https://gotify.net/)
 
-Available template variables:
-
-| Variable | Description |
-|----------|-------------|
-| `{{title}}` | Config title or project directory name |
-| `{{message}}` | Notification message (e.g., "Task completed") |
-| `{{elapsed}}` | Elapsed time (e.g., "(2m 30s)") |
-| `{{project}}` | Project directory name |
-| `{{event}}` | Hook event type (`notification` or `stop`) |
-| `{{notification_type}}` | Notification sub-type (`idle_prompt`, `permission_prompt`, `elicitation_dialog`) |
-
-Additional data is available in the [hook payload](https://code.claude.com/docs/en/hooks) but not currently exposed as template variables: `prompt` (user's last message), `last_assistant_message` (Claude's final response), `transcript_path` (full conversation history), and `cwd` (working directory).
-
-### Icons
-
-Place in `icons/` (gitignored):
-- `notification.png` — shown when Claude needs input
-- `stop.png` — shown when Claude finishes
+Template variables: `{{title}}`, `{{message}}`, `{{elapsed}}`, `{{project}}`, `{{event}}`, `{{notification_type}}`
 
 ## Files
 

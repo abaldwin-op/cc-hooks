@@ -31,6 +31,8 @@ struct Config: Decodable {
     var title: String?
     var terminal: String?
     var editor: String?
+    var desktop: Bool?       // false = skip desktop notification (webhook-only mode)
+    var sound: String?       // "default", sound name, or "" to disable
     var messages: Messages?
     var icons: Icons?
     var webhook: Webhook?
@@ -39,15 +41,21 @@ struct Config: Decodable {
         var notification: String?
         var permission: String?
         var elicitation: String?
+        var idle: String?
         var stop: String?
     }
 
     struct Icons: Decodable {
+        var app: String?
         var notification: String?
+        var permission: String?
+        var elicitation: String?
+        var idle: String?
         var stop: String?
     }
 
     struct Webhook: Decodable {
+        var enabled: Bool?    // false = disable webhook without removing config
         var url: String?
         var idle_minutes: Int?
         var payload: String?  // Path to JSON template file
@@ -91,6 +99,13 @@ func escapeAppleScript(_ s: String) -> String {
      .replacingOccurrences(of: "\n", with: "\\n")
      .replacingOccurrences(of: "\r", with: "\\r")
      .replacingOccurrences(of: "\t", with: "\\t")
+}
+
+/// Escapes a string for safe use inside a single-quoted shell argument.
+/// Single quotes can't be escaped inside single quotes, so we end the quote,
+/// add an escaped single quote, and re-open the quote: 'foo'\''bar'
+func escapeForShellSingleQuote(_ s: String) -> String {
+    s.replacingOccurrences(of: "'", with: "'\\''")
 }
 
 // MARK: - AFK detection
@@ -174,27 +189,46 @@ func shell(_ command: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
-/// Checks if we're running inside a known terminal emulator by walking the process tree.
-/// Returns false if running inside an IDE (VS Code, Zed, Cursor, etc.).
-func isRunningInTerminal(_ terminal: String) -> Bool {
-    let knownTerminals = ["ghostty", "iterm2", "wezterm", "wezterm-gui", "terminal"]
-    let configTerminal = terminal.lowercased()
+/// Runs an AppleScript via osascript stdin (avoids shell quoting issues)
+@discardableResult
+func osascript(_ script: String) -> String {
+    let process = Process()
+    let outPipe = Pipe()
+    let inPipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = ["-"]
+    process.standardInput = inPipe
+    process.standardOutput = outPipe
+    process.standardError = FileHandle.nullDevice
+    try? process.run()
+    inPipe.fileHandleForWriting.write(script.data(using: .utf8) ?? Data())
+    inPipe.fileHandleForWriting.closeFile()
+    process.waitUntilExit()
+    return String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+}
 
+/// Walks the process tree to check if a known terminal emulator is an ancestor.
+/// Returns false if running inside an IDE (Zed, VS Code, Cursor, etc.).
+func isRunningInTerminal(_ terminal: String) -> Bool {
+    let knownTerminals = ["ghostty", "iterm2", "terminal", "wezterm"]
     var pid = ProcessInfo.processInfo.processIdentifier
     for _ in 0..<20 {
-        let output = shell("ps -o comm=,ppid= -p \(pid)")
-        let parts = output.split(separator: " ", maxSplits: 1)
+        let output = shell("ps -o ppid=,comm= -p \(pid)")
+        let trimmed = output.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { break }
+        // ppid is first, comm is the rest
+        let parts = trimmed.split(separator: " ", maxSplits: 1)
         guard parts.count >= 2 else { break }
-        let comm = String(parts[0]).lowercased()
-        let base = (comm as NSString).lastPathComponent
-
-        // Check if any ancestor is a known terminal
-        if knownTerminals.contains(base) || base == configTerminal {
+        let ppid = Int32(parts[0]) ?? 0
+        let comm = String(parts[1])
+        let name = (comm as NSString).lastPathComponent.lowercased()
+        // Check if this ancestor is the configured terminal or a known one
+        if name == terminal.lowercased() || knownTerminals.contains(name) {
             return true
         }
-
-        pid = Int32(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0
-        if pid <= 1 { break }
+        if ppid <= 1 { break }
+        pid = ppid
     }
     return false
 }
@@ -239,7 +273,7 @@ func notifierPidDelete(_ sid: String) {
     try? FileManager.default.removeItem(atPath: notifierPidPath(sid))
 }
 
-/// Kills the previous notification process for this session
+/// Kills the previous notification process for this session and waits for it to exit
 func killPreviousNotifier(_ sid: String) {
     let path = notifierPidPath(sid)
     guard let content = try? String(contentsOfFile: path, encoding: .utf8),
@@ -247,20 +281,34 @@ func killPreviousNotifier(_ sid: String) {
           pid > 0
     else { return }
     kill(pid, SIGTERM)
+    // Wait briefly for the old process to die so it releases the notification
+    for _ in 0..<10 {
+        if kill(pid, 0) != 0 { break } // Process is gone
+        usleep(50_000) // 50ms
+    }
+    // Force kill if still alive
+    if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
     try? FileManager.default.removeItem(atPath: path)
 }
 
-/// Captures the currently focused terminal session/tab ID via AppleScript.
-/// Each terminal has a different API for this.
+/// Captures terminal identifiers for pane-level focus restoration.
+/// Returns "termId::tabId::windowId" for Ghostty, session ID for iTerm2, pane ID for WezTerm.
 func captureTerminalId(_ terminal: String) -> String {
     switch terminal.lowercased() {
     case "ghostty":
-        return shell("""
-            osascript -e 'tell application "Ghostty" to return id of focused terminal of selected tab of front window' 2>/dev/null
+        // Capture terminal (pane), tab, and window IDs for direct focus later
+        // Use :: as separator to avoid collision with | in timer format
+        return osascript("""
+            tell application "Ghostty"
+                set w to front window
+                set tb to selected tab of w
+                set ft to focused terminal of tb
+                return (id of ft) & "::" & (id of tb) & "::" & (id of w)
+            end tell
             """)
     case "iterm", "iterm2":
-        return shell("""
-            osascript -e 'tell application "iTerm2" to return id of current session of current tab of current window' 2>/dev/null
+        return osascript("""
+            tell application "iTerm2" to return id of current session of current tab of current window
             """)
     case "wezterm":
         // $WEZTERM_PANE is set by WezTerm in each pane's environment
@@ -295,11 +343,12 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 }
 
 /// Posts a native macOS notification with an action button.
-/// Spins up a minimal NSApplication to receive delegate callbacks.
+/// Click notification body = focus terminal, action button = open editor.
 /// Blocks until the user interacts or this process is killed.
 /// Returns true if the notification was posted successfully.
 func showNativeNotification(title: String, body: String, groupId: String,
                             editorButtonTitle: String, iconPath: String?,
+                            soundName: String?,
                             onContentClick: @escaping () -> Void,
                             onEditorClick: @escaping () -> Void) -> Bool {
     // NSApplication is required for UNUserNotificationCenter delegate callbacks.
@@ -328,7 +377,7 @@ func showNativeNotification(title: String, body: String, groupId: String,
     }
     center.delegate = delegate
 
-    // Register action category
+    // Register action category — single button for editor, click body for focus
     let editorAction = UNNotificationAction(
         identifier: "OPEN_EDITOR", title: editorButtonTitle, options: .foreground)
     let category = UNNotificationCategory(
@@ -358,12 +407,26 @@ func showNativeNotification(title: String, body: String, groupId: String,
     content.body = body
     content.categoryIdentifier = "CC_HOOKS"
     content.threadIdentifier = groupId
-    content.sound = .default
+    if let soundName = soundName {
+        if soundName.isEmpty {
+            content.sound = nil
+        } else if soundName == "default" {
+            content.sound = .default
+        } else {
+            content.sound = UNNotificationSound(named: UNNotificationSoundName(soundName))
+        }
+    } else {
+        content.sound = .default
+    }
 
     // Attach custom icon if available
+    // UNNotificationAttachment moves the file, so copy to a temp location first
     if let iconPath = iconPath, FileManager.default.fileExists(atPath: iconPath) {
-        if let attachment = try? UNNotificationAttachment(
-            identifier: "icon", url: URL(fileURLWithPath: iconPath)) {
+        let ext = (iconPath as NSString).pathExtension
+        let tmpIcon = NSTemporaryDirectory() + "claude-icon-\(UUID().uuidString).\(ext)"
+        if (try? FileManager.default.copyItem(atPath: iconPath, toPath: tmpIcon)) != nil,
+           let attachment = try? UNNotificationAttachment(
+            identifier: "icon", url: URL(fileURLWithPath: tmpIcon)) {
             content.attachments = [attachment]
         }
     }
@@ -397,17 +460,57 @@ func onSubmit(baseDir: String) -> Int32 {
     let config = loadConfig(baseDir: baseDir)
     let terminal = config.terminal ?? "ghostty"
 
-    // Skip if running inside an IDE (not a known terminal emulator)
-    if !isRunningInTerminal(terminal) { return 0 }
+    let inTerminal = isRunningInTerminal(terminal)
+    let jsonCwd = json["cwd"] as? String ?? FileManager.default.currentDirectoryPath
 
-    let cwd = (json["cwd"] as? String) ?? FileManager.default.currentDirectoryPath
+    // Extract project root from transcript_path:
+    // ~/.claude/projects/-Users-abaldwin-Repos-cc-hooks/session.jsonl
+    // The directory name after "projects/" encodes / as - but directory names
+    // can also contain dashes, so we greedily resolve against the filesystem.
+    let transcriptPath = json["transcript_path"] as? String ?? ""
+    let projectRoot: String = {
+        let parts = transcriptPath.components(separatedBy: "/projects/")
+        guard parts.count > 1 else { return jsonCwd }
+        let encoded = parts[1].components(separatedBy: "/").first ?? ""
+        guard !encoded.isEmpty, encoded.hasPrefix("-") else { return jsonCwd }
+
+        // Greedily decode: try longest possible path segments first
+        let segments = encoded.dropFirst().components(separatedBy: "-")
+        var path = "/"
+        var i = 0
+        while i < segments.count {
+            // Try joining successive segments with "-" to handle dashes in names
+            var best = ""
+            for j in stride(from: segments.count - 1, through: i, by: -1) {
+                let candidate = segments[i...j].joined(separator: "-")
+                let testPath = (path as NSString).appendingPathComponent(candidate)
+                if FileManager.default.fileExists(atPath: testPath) {
+                    best = candidate
+                    i = j + 1
+                    break
+                }
+            }
+            if best.isEmpty {
+                // No match — use single segment
+                best = segments[i]
+                i += 1
+            }
+            path = (path as NSString).appendingPathComponent(best)
+        }
+        return FileManager.default.fileExists(atPath: path) ? path : jsonCwd
+    }()
+
+    // CWD relative to project root for display, project root for editor
+    let cwd = jsonCwd
+    // Skip if running inside an IDE (not a known terminal emulator)
+    if !inTerminal { return 0 }
     let ts = nowMs()
     let editor = config.editor ?? "zed"
     let tty = findTty()
     let terminalId = captureTerminalId(terminal)
 
-    // Format: timestamp|cwd|terminal|editor|tty|terminalId
-    timerWrite(sid, "\(ts)|\(cwd)|\(terminal)|\(editor)|\(tty)|\(terminalId)")
+    // Format: timestamp|cwd|terminal|editor|tty|terminalId|projectRoot
+    timerWrite(sid, "\(ts)|\(cwd)|\(terminal)|\(editor)|\(tty)|\(terminalId)|\(projectRoot)")
 
     return 0
 }
@@ -429,12 +532,32 @@ func notify(hookEvent: String, baseDir: String) -> Int32 {
     else { return 0 }
 
     let startMs = UInt64(timer[0]) ?? 0
-    let cwd = jsonCwd ?? (timer[1].isEmpty ? "" : timer[1])
+    let timerCwd = timer[1]
     let terminal = timer[2]
     let editor = timer[3]
     let tty = timer.count > 4 ? timer[4] : ""
     let terminalId = timer.count > 5 ? timer[5] : ""
-    let dir = (cwd as NSString).lastPathComponent
+    let projectRoot = timer.count > 6 ? timer[6] : ""
+
+    // Use jsonCwd for title (shows where Claude is NOW), timer CWD for focus
+    let displayCwd = jsonCwd ?? timerCwd
+    let focusCwd = timerCwd.isEmpty ? (jsonCwd ?? "") : timerCwd
+
+    // Title: show relative path from project root, e.g. "cc-hooks/macos/notifications"
+    let dir: String = {
+        if !projectRoot.isEmpty && displayCwd.hasPrefix(projectRoot) {
+            let rootName = (projectRoot as NSString).lastPathComponent
+            let relative = String(displayCwd.dropFirst(projectRoot.count))
+            if relative.isEmpty || relative == "/" {
+                return rootName
+            }
+            let trimmed = relative.hasPrefix("/") ? String(relative.dropFirst()) : relative
+            return "\(rootName)/\(trimmed)"
+        }
+        return (displayCwd as NSString).lastPathComponent
+    }()
+    // Editor always opens at project root
+    let editorCwd = projectRoot.isEmpty ? focusCwd : projectRoot
 
     let config = loadConfig(baseDir: baseDir)
     let elapsed = formatElapsed(nowMs() - startMs)
@@ -448,6 +571,8 @@ func notify(hookEvent: String, baseDir: String) -> Int32 {
             message = config.messages?.permission ?? "Claude needs permission"
         case "elicitation_dialog":
             message = config.messages?.elicitation ?? "Action required"
+        case "idle_prompt":
+            message = config.messages?.idle ?? "Claude is waiting"
         default:
             message = config.messages?.notification ?? "Claude needs your input"
         }
@@ -456,29 +581,32 @@ func notify(hookEvent: String, baseDir: String) -> Int32 {
     // Kill previous notification process for this session
     killPreviousNotifier(sid)
 
-    // Icon: use config or default
-    let iconFile: String
-    if hookEvent == "stop" {
-        iconFile = config.icons?.stop ?? "icons/stop.png"
-    } else {
-        iconFile = config.icons?.notification ?? "icons/notification.png"
-    }
-    let iconPath = (baseDir as NSString).appendingPathComponent(iconFile)
+    // Icon: per-type from config, falls back to notification icon
+    let iconFile: String? = {
+        if hookEvent == "stop" { return config.icons?.stop }
+        switch notificationType {
+        case "permission_prompt": return config.icons?.permission ?? config.icons?.notification
+        case "elicitation_dialog": return config.icons?.elicitation ?? config.icons?.notification
+        case "idle_prompt": return config.icons?.idle ?? config.icons?.notification
+        default: return config.icons?.notification
+        }
+    }()
+    let iconPath = iconFile.map { (baseDir as NSString).appendingPathComponent($0) } ?? ""
 
     let groupId = "claude-\(sid)"
     let editorButton = "Open in \(editorAppName(editor))"
     let body = "\(message) \(elapsed)"
 
-    // Send webhook if configured (only when AFK)
+    // Send webhook after notification (only when AFK, or always if idle_minutes == 0)
     // auth_success is already skipped above
-    // Guard: elapsed time must also exceed idle_minutes — can't be AFK longer
-    // than Claude has been running since the last user prompt.
     let elapsedSecs = (nowMs() - startMs) / 1000
-    if let webhook = config.webhook,
+    if let webhook = config.webhook, webhook.enabled ?? true,
        let webhookUrl = webhook.url, !webhookUrl.isEmpty,
        let payloadFile = webhook.payload, !payloadFile.isEmpty {
         let idleMinutes = webhook.idle_minutes ?? 15
-        if elapsedSecs >= UInt64(idleMinutes) * 60 && isAFK(idleMinutes: idleMinutes) {
+        let send = idleMinutes == 0
+            || (elapsedSecs >= UInt64(idleMinutes) * 60 && isAFK(idleMinutes: idleMinutes))
+        if send {
             let templatePath = (baseDir as NSString).appendingPathComponent(payloadFile)
             let vars: [String: String] = [
                 "title": config.title ?? dir,
@@ -494,20 +622,28 @@ func notify(hookEvent: String, baseDir: String) -> Int32 {
         }
     }
 
+    // Skip desktop notification if disabled
+    if config.desktop == false {
+        notifierPidDelete(sid)
+        return 0
+    }
+
     // Save our PID so next notification can kill this process
     try? "\(ProcessInfo.processInfo.processIdentifier)".write(
         toFile: notifierPidPath(sid), atomically: true, encoding: .utf8)
 
     // Try native macOS notification first
+    // Click body = focus terminal, action button = open editor
     let nativeOk = showNativeNotification(
         title: dir, body: body, groupId: groupId,
         editorButtonTitle: editorButton,
         iconPath: FileManager.default.fileExists(atPath: iconPath) ? iconPath : nil,
+        soundName: config.sound,
         onContentClick: {
-            focusTerminal(terminal: terminal, cwd: cwd, tty: tty, terminalId: terminalId)
+            focusTerminal(terminal: terminal, cwd: focusCwd, tty: tty, terminalId: terminalId)
         },
         onEditorClick: {
-            openEditor(editor: editor, cwd: cwd)
+            openEditor(editor: editor, cwd: editorCwd)
         }
     )
 
@@ -554,9 +690,9 @@ func notify(hookEvent: String, baseDir: String) -> Int32 {
 
             switch result {
             case "@CONTENTCLICKED":
-                focusTerminal(terminal: terminal, cwd: cwd, tty: tty, terminalId: terminalId)
+                focusTerminal(terminal: terminal, cwd: focusCwd, tty: tty, terminalId: terminalId)
             case let action where action.hasPrefix("Open in"):
-                openEditor(editor: editor, cwd: cwd)
+                openEditor(editor: editor, cwd: editorCwd)
             default:
                 break
             }
@@ -585,135 +721,168 @@ func focusTerminal(terminal: String, cwd: String, tty: String, terminalId: Strin
 
     switch terminal.lowercased() {
     case "ghostty":
-        if !terminalId.isEmpty {
-            // Match by saved terminal ID
-            shell("""
-                osascript -e '
-                tell application "Ghostty"
-                    activate
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            repeat with term in terminals of t
-                                if id of term is "\(eTermId)" then
-                                    focus term
-                                    return
+        // terminalId format: "termId::tabId::windowId" (captured at on-submit)
+        let parts = terminalId.components(separatedBy: "::")
+        let termId = parts.count > 0 ? escapeAppleScript(parts[0]) : ""
+        let tabId = parts.count > 1 ? escapeAppleScript(parts[1]) : ""
+        let windowId = parts.count > 2 ? escapeAppleScript(parts[2]) : ""
+        // activate window deminiaturizes + brings to front (calls makeKeyAndOrderFront)
+        // System Events cannot see Ghostty windows (GPU/Metal rendering)
+        osascript("""
+            tell application "Ghostty"
+                -- Pass 1: direct terminal+tab+window ID (fastest, most reliable)
+                if "\(tabId)" is not "" and "\(windowId)" is not "" then
+                    try
+                        set w to window id "\(windowId)"
+                        activate window w
+                        select tab (tab id "\(tabId)" of w)
+                        if "\(termId)" is not "" then
+                            repeat with t in terminals of (selected tab of w)
+                                if (id of t) is "\(termId)" then
+                                    focus t
+                                    exit repeat
                                 end if
                             end repeat
+                        end if
+                        return
+                    on error errMsg
+                        -- Fall through to pass 2
+                    end try
+                end if
+                -- Pass 2: exact CWD + "Claude" in name
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        repeat with term in terminals of tb
+                            set termDir to working directory of term
+                            if name of term contains "Claude" and termDir is "\(eCwd)" then
+                                activate window w
+                                select tab (tab id (id of tb) of w)
+                                focus term
+                                return
+                            end if
                         end repeat
                     end repeat
-                end tell'
-                """)
-        } else {
-            // Fallback: match by working directory
-            shell("""
-                osascript -e '
-                tell application "Ghostty"
-                    activate
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            repeat with term in terminals of t
-                                if working directory of term contains "\(eCwd)" then
-                                    focus term
-                                    return
-                                end if
-                            end repeat
+                end repeat
+                -- Pass 3: prefix CWD match
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        repeat with term in terminals of tb
+                            if ("\(eCwd)" starts with (working directory of term) or (working directory of term) starts with "\(eCwd)") then
+                                activate window w
+                                select tab (tab id (id of tb) of w)
+                                focus term
+                                return
+                            end if
                         end repeat
                     end repeat
-                end tell'
-                """)
-        }
-
+                end repeat
+            end tell
+            """)
     case "iterm", "iterm2":
-        if !terminalId.isEmpty {
-            // Match by saved session ID
-            shell("""
-                osascript -e '
-                tell application "iTerm2"
-                    activate
+        osascript("""
+            tell application "iTerm2" to activate
+            tell application "iTerm2"
+                -- Pass 1: session ID match
+                if "\(eTermId)" is not "" then
                     repeat with w in windows
-                        repeat with t in tabs of w
-                            repeat with s in sessions of t
-                                if id of s is "\(eTermId)" then
-                                    select w
-                                    select t
-                                    select s
+                        repeat with tb in tabs of w
+                            repeat with sess in sessions of tb
+                                if id of sess is "\(eTermId)" then
+                                    set index of w to 1
+                                    select tb
+                                    select sess
                                     return
                                 end if
                             end repeat
                         end repeat
                     end repeat
-                end tell'
-                """)
-        } else if !tty.isEmpty {
-            // Fallback: match by tty (less reliable — tty can be reused)
-            shell("""
-                osascript -e '
-                tell application "iTerm2"
-                    activate
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            repeat with s in sessions of t
-                                if tty of s is "\(eTty)" then
-                                    select w
-                                    select t
-                                    select s
-                                    return
-                                end if
-                            end repeat
+                end if
+                -- Pass 2: CWD + "Claude" in name
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        repeat with sess in sessions of tb
+                            set sessDir to variable named "path" in sess
+                            if name of sess contains "Claude" and sessDir is "\(eCwd)" then
+                                set index of w to 1
+                                select tb
+                                select sess
+                                return
+                            end if
                         end repeat
                     end repeat
-                end tell'
-                """)
-        } else {
-            shell("osascript -e 'tell application \"iTerm2\" to activate'")
-        }
+                end repeat
+                -- Pass 3: prefix CWD match
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        repeat with sess in sessions of tb
+                            set sessDir to variable named "path" in sess
+                            if ("\(eCwd)" starts with sessDir or sessDir starts with "\(eCwd)") then
+                                set index of w to 1
+                                select tb
+                                select sess
+                                return
+                            end if
+                        end repeat
+                    end repeat
+                end repeat
+            end tell
+            """)
 
     case "terminal":
-        // Terminal.app has no split panes — tty matching is sufficient
-        if !tty.isEmpty {
-            shell("""
-                osascript -e '
-                tell application "Terminal"
-                    activate
+        osascript("""
+            tell application "Terminal" to activate
+            tell application "Terminal"
+                -- Pass 1: tty match
+                if "\(eTty)" is not "" then
                     repeat with w in windows
-                        repeat with t in tabs of w
-                            if tty of t is "\(eTty)" then
-                                set selected tab of w to t
+                        repeat with tb in tabs of w
+                            if tty of tb is "\(eTty)" then
+                                set selected tab of w to tb
                                 set index of w to 1
                                 return
                             end if
                         end repeat
                     end repeat
-                end tell'
-                """)
-        } else {
-            shell("osascript -e 'tell application \"Terminal\" to activate'")
-        }
+                end if
+                -- Pass 2: Claude process match
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        if custom title of tb contains "Claude" or processes of tb contains "claude" then
+                            set selected tab of w to tb
+                            set index of w to 1
+                            return
+                        end if
+                    end repeat
+                end repeat
+            end tell
+            """)
 
     case "wezterm":
         if !terminalId.isEmpty {
-            shell("wezterm cli activate-pane --pane-id '\(eTermId)'")
+            let sTermId = escapeForShellSingleQuote(terminalId)
+            shell("wezterm cli activate-pane --pane-id '\(sTermId)'")
         }
-        // Bring WezTerm window to front
-        shell("osascript -e 'tell application \"WezTerm\" to activate'")
+        osascript("tell application \"WezTerm\" to activate")
 
     default:
         let appName = terminalAppName(terminal)
-        shell("osascript -e 'tell application \"\(appName)\" to activate'")
+        osascript("tell application \"\(appName)\" to activate")
     }
 }
 
 func openEditor(editor: String, cwd: String) {
     let appName = editorAppName(editor)
+    let sCwd = escapeForShellSingleQuote(cwd)
+    let sApp = escapeForShellSingleQuote(appName)
     switch editor.lowercased() {
     case "zed":
-        shell("open -a \"\(appName)\" \"\(cwd)\"")
+        shell("open -a '\(sApp)' '\(sCwd)'")
     case "code", "vscode":
-        shell("code \"\(cwd)\"")
+        shell("code '\(sCwd)'")
     case "cursor":
-        shell("cursor \"\(cwd)\"")
+        shell("cursor '\(sCwd)'")
     default:
-        shell("open -a \"\(appName)\" \"\(cwd)\"")
+        shell("open -a '\(sApp)' '\(sCwd)'")
     }
 }
 
@@ -750,11 +919,12 @@ func installHooks(exePath: String) -> Int32 {
 
     // Notification and Stop hooks are async because the notification handler
     // blocks until the user clicks/dismisses.
+    let quotedExe = "'\(escapeForShellSingleQuote(exePath))'"
     let hookEntries: [(String, String, Bool)] = [
-        ("UserPromptSubmit", "\(exePath) on-submit", false),
-        ("Notification", "\(exePath) notify notification", true),
-        ("Stop", "\(exePath) notify stop", true),
-        ("SessionEnd", "\(exePath) on-end", false),
+        ("UserPromptSubmit", "\(quotedExe) on-submit", false),
+        ("Notification", "\(quotedExe) notify notification", true),
+        ("Stop", "\(quotedExe) notify stop", true),
+        ("SessionEnd", "\(quotedExe) on-end", false),
     ]
 
     var hooks = settings["hooks"] as? [String: Any] ?? [:]
