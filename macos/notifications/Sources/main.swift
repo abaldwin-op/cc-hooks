@@ -208,47 +208,28 @@ func osascript(_ script: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
-/// Checks whether Claude Code was launched interactively by a user in a shell,
-/// as opposed to programmatically via Agent SDK (Goose, Zed, etc.).
-/// Walks up the process tree from the hook, skips intermediate shells, and checks
-/// whether the Claude runtime's parent is a known shell.
-func isInteractiveSession() -> Bool {
-    let knownShells: Set<String> = [
-        "zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh",
-        "nu", "nushell", "pwsh", "elvish", "xonsh",
-    ]
-
+/// Walks the process tree to check if a known terminal emulator is an ancestor.
+/// Returns false if running inside an IDE (Zed, VS Code, Cursor, etc.).
+func isRunningInTerminal(_ terminal: String) -> Bool {
+    let knownTerminals = ["ghostty", "iterm2", "terminal", "wezterm"]
     var pid = ProcessInfo.processInfo.processIdentifier
-
     for _ in 0..<20 {
         let output = shell("ps -o ppid=,comm= -p \(pid)")
         let trimmed = output.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty else { break }
+        // ppid is first, comm is the rest
         let parts = trimmed.split(separator: " ", maxSplits: 1)
-        guard parts.count >= 2 else { return false }
+        guard parts.count >= 2 else { break }
         let ppid = Int32(parts[0]) ?? 0
         let comm = String(parts[1])
-        var name = (comm as NSString).lastPathComponent.lowercased()
-        // Login shells show as -zsh, -bash, etc.
-        if name.hasPrefix("-") { name = String(name.dropFirst()) }
-
-        if ppid <= 1 { return false }
-
-        // Skip intermediate shells (hook may be wrapped in sh -c)
-        if knownShells.contains(name) {
-            pid = ppid
-            continue
+        let name = (comm as NSString).lastPathComponent.lowercased()
+        // Check if this ancestor is the configured terminal or a known one
+        if name == terminal.lowercased() || knownTerminals.contains(name) {
+            return true
         }
-
-        // First non-shell ancestor = Claude runtime. Check ITS parent.
-        let parentOutput = shell("ps -o comm= -p \(ppid)")
-        var parentName = (parentOutput.trimmingCharacters(in: .whitespaces) as NSString)
-            .lastPathComponent.lowercased()
-        if parentName.hasPrefix("-") { parentName = String(parentName.dropFirst()) }
-
-        return knownShells.contains(parentName)
+        if ppid <= 1 { break }
+        pid = ppid
     }
-
     return false
 }
 
@@ -515,8 +496,7 @@ func onSubmit(baseDir: String) -> Int32 {
     let config = loadConfig(baseDir: baseDir)
     let terminal = config.terminal ?? "ghostty"
 
-    // Skip if not launched interactively (Agent SDK: Goose, Zed, etc.)
-    if !isInteractiveSession() { return 0 }
+    let inTerminal = isRunningInTerminal(terminal)
 
     let jsonCwd = json["cwd"] as? String ?? FileManager.default.currentDirectoryPath
 
@@ -559,6 +539,8 @@ func onSubmit(baseDir: String) -> Int32 {
 
     // CWD relative to project root for display, project root for editor
     let cwd = jsonCwd
+    // Skip if running inside an IDE (not a known terminal emulator)
+    if !inTerminal { return 0 }
     let ts = nowMs()
     let editor = config.editor ?? "zed"
     let tty = findTty()
