@@ -208,28 +208,47 @@ func osascript(_ script: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
-/// Walks the process tree to check if a known terminal emulator is an ancestor.
-/// Returns false if running inside an IDE (Zed, VS Code, Cursor, etc.).
-func isRunningInTerminal(_ terminal: String) -> Bool {
-    let knownTerminals = ["ghostty", "iterm2", "terminal", "wezterm"]
+/// Checks whether Claude Code was launched interactively by a user in a shell,
+/// as opposed to programmatically via Agent SDK (Goose, Zed, etc.).
+/// Walks up the process tree from the hook, skips intermediate shells, and checks
+/// whether the Claude runtime's parent is a known shell.
+func isInteractiveSession() -> Bool {
+    let knownShells: Set<String> = [
+        "zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh",
+        "nu", "nushell", "pwsh", "elvish", "xonsh",
+    ]
+
     var pid = ProcessInfo.processInfo.processIdentifier
+
     for _ in 0..<20 {
         let output = shell("ps -o ppid=,comm= -p \(pid)")
         let trimmed = output.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { break }
-        // ppid is first, comm is the rest
+        guard !trimmed.isEmpty else { return false }
         let parts = trimmed.split(separator: " ", maxSplits: 1)
-        guard parts.count >= 2 else { break }
+        guard parts.count >= 2 else { return false }
         let ppid = Int32(parts[0]) ?? 0
         let comm = String(parts[1])
-        let name = (comm as NSString).lastPathComponent.lowercased()
-        // Check if this ancestor is the configured terminal or a known one
-        if name == terminal.lowercased() || knownTerminals.contains(name) {
-            return true
+        var name = (comm as NSString).lastPathComponent.lowercased()
+        // Login shells show as -zsh, -bash, etc.
+        if name.hasPrefix("-") { name = String(name.dropFirst()) }
+
+        if ppid <= 1 { return false }
+
+        // Skip intermediate shells (hook may be wrapped in sh -c)
+        if knownShells.contains(name) {
+            pid = ppid
+            continue
         }
-        if ppid <= 1 { break }
-        pid = ppid
+
+        // First non-shell ancestor = Claude runtime. Check ITS parent.
+        let parentOutput = shell("ps -o comm= -p \(ppid)")
+        var parentName = (parentOutput.trimmingCharacters(in: .whitespaces) as NSString)
+            .lastPathComponent.lowercased()
+        if parentName.hasPrefix("-") { parentName = String(parentName.dropFirst()) }
+
+        return knownShells.contains(parentName)
     }
+
     return false
 }
 
@@ -293,17 +312,53 @@ func killPreviousNotifier(_ sid: String) {
 
 /// Captures terminal identifiers for pane-level focus restoration.
 /// Returns "termId::tabId::windowId" for Ghostty, session ID for iTerm2, pane ID for WezTerm.
-func captureTerminalId(_ terminal: String) -> String {
+func captureTerminalId(_ terminal: String, cwd: String = "", projectRoot: String = "") -> String {
     switch terminal.lowercased() {
     case "ghostty":
-        // Capture terminal (pane), tab, and window IDs for direct focus later
-        // Use :: as separator to avoid collision with | in timer format
+        // Match by CWD to avoid race condition when two sessions fire on-submit simultaneously.
+        // The focused terminal is only used as a tiebreaker when multiple panes share a directory.
+        let eCwd = escapeAppleScript(cwd)
+        let eRoot = escapeAppleScript(projectRoot)
         return osascript("""
             tell application "Ghostty"
-                set w to front window
-                set tb to selected tab of w
-                set ft to focused terminal of tb
-                return (id of ft) & "::" & (id of tb) & "::" & (id of w)
+                set candidates to {}
+                set focusedId to ""
+                try
+                    set focusedId to id of focused terminal of selected tab of front window
+                end try
+                repeat with w in windows
+                    repeat with tb in tabs of w
+                        repeat with term in terminals of tb
+                            set d to working directory of term
+                            if d is "\(eCwd)" or d is "\(eRoot)" or ("\(eCwd)" starts with d) then
+                                set end of candidates to {termId:id of term, tabId:id of tb, winId:id of w}
+                            end if
+                        end repeat
+                    end repeat
+                end repeat
+                if (count of candidates) is 0 then
+                    -- No CWD match; fall back to focused terminal
+                    try
+                        set w to front window
+                        set tb to selected tab of w
+                        set ft to focused terminal of tb
+                        return (id of ft) & "::" & (id of tb) & "::" & (id of w)
+                    end try
+                    return ""
+                end if
+                if (count of candidates) is 1 then
+                    set c to item 1 of candidates
+                    return (termId of c) & "::" & (tabId of c) & "::" & (winId of c)
+                end if
+                -- Multiple matches: prefer the focused terminal as tiebreaker
+                repeat with c in candidates
+                    if (termId of c) is focusedId then
+                        return (termId of c) & "::" & (tabId of c) & "::" & (winId of c)
+                    end if
+                end repeat
+                -- None focused; use first candidate
+                set c to item 1 of candidates
+                return (termId of c) & "::" & (tabId of c) & "::" & (winId of c)
             end tell
             """)
     case "iterm", "iterm2":
@@ -460,7 +515,9 @@ func onSubmit(baseDir: String) -> Int32 {
     let config = loadConfig(baseDir: baseDir)
     let terminal = config.terminal ?? "ghostty"
 
-    let inTerminal = isRunningInTerminal(terminal)
+    // Skip if not launched interactively (Agent SDK: Goose, Zed, etc.)
+    if !isInteractiveSession() { return 0 }
+
     let jsonCwd = json["cwd"] as? String ?? FileManager.default.currentDirectoryPath
 
     // Extract project root from transcript_path:
@@ -502,12 +559,18 @@ func onSubmit(baseDir: String) -> Int32 {
 
     // CWD relative to project root for display, project root for editor
     let cwd = jsonCwd
-    // Skip if running inside an IDE (not a known terminal emulator)
-    if !inTerminal { return 0 }
     let ts = nowMs()
     let editor = config.editor ?? "zed"
     let tty = findTty()
-    let terminalId = captureTerminalId(terminal)
+    let terminalId = captureTerminalId(terminal, cwd: cwd, projectRoot: projectRoot)
+
+    // Clear any displayed notification for this session — user is actively engaged.
+    // Spawn a short-lived background process so we don't block the synchronous hook.
+    let selfPath = ProcessInfo.processInfo.arguments[0]
+    let clearProc = Process()
+    clearProc.executableURL = URL(fileURLWithPath: selfPath)
+    clearProc.arguments = ["clear-notification", sid]
+    try? clearProc.run()
 
     // Format: timestamp|cwd|terminal|editor|tty|terminalId|projectRoot
     timerWrite(sid, "\(ts)|\(cwd)|\(terminal)|\(editor)|\(tty)|\(terminalId)|\(projectRoot)")
@@ -730,7 +793,7 @@ func focusTerminal(terminal: String, cwd: String, tty: String, terminalId: Strin
         // System Events cannot see Ghostty windows (GPU/Metal rendering)
         osascript("""
             tell application "Ghostty"
-                -- Pass 1: direct terminal+tab+window ID (fastest, most reliable)
+                -- Direct terminal+tab+window ID match
                 if "\(tabId)" is not "" and "\(windowId)" is not "" then
                     try
                         set w to window id "\(windowId)"
@@ -745,37 +808,10 @@ func focusTerminal(terminal: String, cwd: String, tty: String, terminalId: Strin
                             end repeat
                         end if
                         return
-                    on error errMsg
-                        -- Fall through to pass 2
                     end try
                 end if
-                -- Pass 2: exact CWD + "Claude" in name
-                repeat with w in windows
-                    repeat with tb in tabs of w
-                        repeat with term in terminals of tb
-                            set termDir to working directory of term
-                            if name of term contains "Claude" and termDir is "\(eCwd)" then
-                                activate window w
-                                select tab (tab id (id of tb) of w)
-                                focus term
-                                return
-                            end if
-                        end repeat
-                    end repeat
-                end repeat
-                -- Pass 3: prefix CWD match
-                repeat with w in windows
-                    repeat with tb in tabs of w
-                        repeat with term in terminals of tb
-                            if ("\(eCwd)" starts with (working directory of term) or (working directory of term) starts with "\(eCwd)") then
-                                activate window w
-                                select tab (tab id (id of tb) of w)
-                                focus term
-                                return
-                            end if
-                        end repeat
-                    end repeat
-                end repeat
+                -- IDs stale or missing; just activate Ghostty without guessing a pane
+                activate
             end tell
             """)
     case "iterm", "iterm2":
@@ -874,6 +910,24 @@ func openEditor(editor: String, cwd: String) {
     let appName = editorAppName(editor)
     let sCwd = escapeForShellSingleQuote(cwd)
     let sApp = escapeForShellSingleQuote(appName)
+    let eApp = escapeAppleScript(appName)
+    // Use the project directory basename to find the matching window title.
+    // Editors typically show the project folder name in the window title.
+    // AXRaise + set frontmost brings only that window to front, even from Stage Manager.
+    // Returns "raised" if successful so we can skip the open command.
+    let dirName = escapeAppleScript((cwd as NSString).lastPathComponent)
+    let raised = osascript("""
+        tell application "System Events"
+            set appProc to first process whose name is "\(eApp)"
+            repeat with w in windows of appProc
+                if name of w contains "\(dirName)" then
+                    perform action "AXRaise" of w
+                    return "raised"
+                end if
+            end repeat
+        end tell
+        """)
+    if raised == "raised" { return }
     switch editor.lowercased() {
     case "zed":
         shell("open -a '\(sApp)' '\(sCwd)'")
@@ -1034,6 +1088,20 @@ case "focus":
     code = 0
 case "on-end":
     code = onEnd()
+case "clear-notification":
+    // Spawned by on-submit to clear displayed notifications without blocking.
+    // Needs NSApplication for UNUserNotificationCenter to work.
+    let sid = args.count > 2 ? args[2] : ""
+    if !sid.isEmpty {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let center = UNUserNotificationCenter.current()
+        let groupId = "claude-\(sid)"
+        center.removeDeliveredNotifications(withIdentifiers: [groupId])
+        center.removePendingNotificationRequests(withIdentifiers: [groupId])
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+    }
+    code = 0
 case "install":
     code = installHooks(exePath: exePath)
 case "uninstall":
