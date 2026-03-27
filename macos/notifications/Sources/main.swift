@@ -311,7 +311,7 @@ func captureTerminalId(_ terminal: String, cwd: String = "", projectRoot: String
                     repeat with tb in tabs of w
                         repeat with term in terminals of tb
                             set d to working directory of term
-                            if d is "\(eCwd)" or d is "\(eRoot)" or ("\(eCwd)" starts with d) then
+                            if d is "\(eCwd)" or d is "\(eRoot)" or ("\(eCwd)" starts with d and d starts with "\(eRoot)") then
                                 set end of candidates to {termId:id of term, tabId:id of tb, winId:id of w}
                             end if
                         end repeat
@@ -773,27 +773,43 @@ func focusTerminal(terminal: String, cwd: String, tty: String, terminalId: Strin
         let windowId = parts.count > 2 ? escapeAppleScript(parts[2]) : ""
         // activate window deminiaturizes + brings to front (calls makeKeyAndOrderFront)
         // System Events cannot see Ghostty windows (GPU/Metal rendering)
+        // Ghostty tabs don't support select/set via AppleScript, but
+        // "focus terminal" auto-switches to the terminal's tab.
         osascript("""
             tell application "Ghostty"
-                -- Direct terminal+tab+window ID match
-                if "\(tabId)" is not "" and "\(windowId)" is not "" then
+                -- Primary: activate window + focus terminal by ID
+                if "\(termId)" is not "" and "\(windowId)" is not "" then
                     try
                         set w to window id "\(windowId)"
                         activate window w
-                        select tab (tab id "\(tabId)" of w)
-                        if "\(termId)" is not "" then
-                            repeat with t in terminals of (selected tab of w)
+                        if "\(tabId)" is not "" then
+                            repeat with t in terminals of (tab id "\(tabId)" of w)
                                 if (id of t) is "\(termId)" then
                                     focus t
-                                    exit repeat
+                                    return
                                 end if
                             end repeat
                         end if
-                        return
                     end try
                 end if
-                -- IDs stale or missing; just activate Ghostty without guessing a pane
+                -- Fallback: search all terminals by CWD
                 activate
+                if "\(eCwd)" is not "" then
+                    try
+                        repeat with w in windows
+                            repeat with tb in tabs of w
+                                repeat with term in terminals of tb
+                                    set d to working directory of term
+                                    if d is "\(eCwd)" or "\(eCwd)" starts with (d & "/") or d starts with ("\(eCwd)" & "/") then
+                                        activate window w
+                                        focus term
+                                        return
+                                    end if
+                                end repeat
+                            end repeat
+                        end repeat
+                    end try
+                end if
             end tell
             """)
     case "iterm", "iterm2":
